@@ -1,15 +1,10 @@
-import { useEffect, useState, useRef } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState, useRef } from "react";
 import { Link, Download, Wand2, FileAudio, Scissors, Sparkles, Settings, Upload, Layers, Zap } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { GlassCard } from "./GlassCard";
 import { WorkflowStep } from "./WorkflowStep";
 import { ClipCard } from "./ClipCard";
-import { VideoPreview } from "./VideoPreview";
-import { ClipEditor } from "./ClipEditor";
-import { SettingsPanel } from "./SettingsPanel";
-import { BatchProcessor } from "./BatchProcessor";
-import { ExportPresets } from "./ExportPresets";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 import { exportClipFromBackend } from "@/lib/backend";
@@ -45,6 +40,14 @@ interface RecentJob {
   error_message: string | null;
   created_at: string;
 }
+
+const SettingsPanel = lazy(() => import("./SettingsPanel").then((mod) => ({ default: mod.SettingsPanel })));
+const BatchProcessor = lazy(() => import("./BatchProcessor").then((mod) => ({ default: mod.BatchProcessor })));
+const ExportPresets = lazy(() => import("./ExportPresets").then((mod) => ({ default: mod.ExportPresets })));
+const VideoPreview = lazy(() => import("./VideoPreview").then((mod) => ({ default: mod.VideoPreview })));
+const ClipEditor = lazy(() => import("./ClipEditor").then((mod) => ({ default: mod.ClipEditor })));
+
+const ACTIVE_JOB_STATUSES = new Set(["pending", "downloading", "transcribing", "analyzing", "generating"]);
 
 const formatTime = (seconds: number): string => {
   const mins = Math.floor(seconds / 60);
@@ -111,7 +114,18 @@ export function ClipGenerator() {
 
   useEffect(() => {
     void loadRecentJobs();
-  }, []);
+  }, [loadRecentJobs]);
+
+  useEffect(() => {
+    const shouldPoll = isProcessing || recentJobs.some((job) => ACTIVE_JOB_STATUSES.has(job.status));
+    if (!shouldPoll) return;
+
+    const interval = window.setInterval(() => {
+      void loadRecentJobs();
+    }, 4000);
+
+    return () => window.clearInterval(interval);
+  }, [isProcessing, recentJobs, loadRecentJobs]);
 
   const processVideo = async (videoUrl?: string, inputType: "url" | "upload" = "url") => {
     const targetUrl = (videoUrl || url).trim();
@@ -289,7 +303,7 @@ export function ClipGenerator() {
     URL.revokeObjectURL(blobUrl);
   };
 
-  const loadRecentJobs = async () => {
+  const loadRecentJobs = useCallback(async () => {
     const { data, error } = await supabase
       .from("clip_jobs")
       .select("id, video_url, video_title, status, error_message, created_at")
@@ -299,7 +313,7 @@ export function ClipGenerator() {
     if (!error && data) {
       setRecentJobs(data as RecentJob[]);
     }
-  };
+  }, []);
 
   const createClipJob = async (videoUrl: string, videoTitle?: string, uploadedFileUrl?: string) => {
     const { data, error } = await supabase
@@ -600,61 +614,66 @@ export function ClipGenerator() {
       </div>
 
       {/* Modals */}
-      <SettingsPanel isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
-      <BatchProcessor isOpen={batchOpen} onClose={() => setBatchOpen(false)} onProcess={handleBatchProcess} />
-      <ExportPresets
-        isOpen={exportOpen}
-        onClose={() => setExportOpen(false)}
-        clips={clips}
-        onExport={(preset) => { clips.forEach((clip) => handleDownload(clip, preset)); setExportOpen(false); }}
-      />
+      <Suspense fallback={null}>
+        <SettingsPanel isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+        <BatchProcessor isOpen={batchOpen} onClose={() => setBatchOpen(false)} onProcess={handleBatchProcess} />
+        <ExportPresets
+          isOpen={exportOpen}
+          onClose={() => setExportOpen(false)}
+          clips={clips}
+          onExport={(preset) => {
+            clips.forEach((clip) => handleDownload(clip, preset));
+            setExportOpen(false);
+          }}
+        />
 
-      <VideoPreview
-        isOpen={!!previewClip}
-        onClose={() => setPreviewClip(null)}
-        videoUrl={sourceUrl || url}
-        clipData={previewClip ? {
-          id: previewClip.id,
-          clipNumber: previewClip.clipNumber,
-          startTime: previewClip.start,
-          endTime: previewClip.end,
-          reason: previewClip.reason,
-          transcript: previewClip.transcript,
-          captions: previewClip.captions,
-          exportPreset: previewClip.exportPreset,
-        } : null}
-        onEdit={() => { setEditingClip(previewClip); setPreviewClip(null); }}
-        onDownload={() => { if (previewClip) handleDownload(previewClip); }}
-      />
+        <VideoPreview
+          isOpen={!!previewClip}
+          onClose={() => setPreviewClip(null)}
+          videoUrl={sourceUrl || url}
+          clipData={previewClip ? {
+            id: previewClip.id,
+            clipNumber: previewClip.clipNumber,
+            startTime: previewClip.start,
+            endTime: previewClip.end,
+            reason: previewClip.reason,
+            transcript: previewClip.transcript,
+            captions: previewClip.captions,
+            exportPreset: previewClip.exportPreset,
+          } : null}
+          onEdit={() => { setEditingClip(previewClip); setPreviewClip(null); }}
+          onDownload={() => { if (previewClip) handleDownload(previewClip); }}
+        />
 
-      <ClipEditor
-        isOpen={!!editingClip}
-        onClose={() => setEditingClip(null)}
-        clipData={editingClip ? {
-          id: editingClip.id,
-          clipNumber: editingClip.clipNumber,
-          startTime: editingClip.start,
-          endTime: editingClip.end,
-          reason: editingClip.reason,
-          transcript: editingClip.transcript,
-          captions: editingClip.captions,
-          exportPreset: editingClip.exportPreset,
-        } : null}
-        onSave={(updated) => {
-          setClips(prev =>
-            prev.map(c => c.id === updated.id ? { ...c, start: updated.startTime, end: updated.endTime, captions: updated.captions, exportPreset: updated.aspectRatio } : c)
-          );
-        }}
-        onGenerateCaptions={async (style) => {
-          if (editingClip) {
-            const { data } = await supabase.functions.invoke("generate-captions", {
-              body: { transcript: editingClip.transcript, clipStart: editingClip.start, clipEnd: editingClip.end, style },
-            });
-            return data?.captions || [];
-          }
-          return [];
-        }}
-      />
+        <ClipEditor
+          isOpen={!!editingClip}
+          onClose={() => setEditingClip(null)}
+          clipData={editingClip ? {
+            id: editingClip.id,
+            clipNumber: editingClip.clipNumber,
+            startTime: editingClip.start,
+            endTime: editingClip.end,
+            reason: editingClip.reason,
+            transcript: editingClip.transcript,
+            captions: editingClip.captions,
+            exportPreset: editingClip.exportPreset,
+          } : null}
+          onSave={(updated) => {
+            setClips(prev =>
+              prev.map(c => c.id === updated.id ? { ...c, start: updated.startTime, end: updated.endTime, captions: updated.captions, exportPreset: updated.aspectRatio } : c)
+            );
+          }}
+          onGenerateCaptions={async (style) => {
+            if (editingClip) {
+              const { data } = await supabase.functions.invoke("generate-captions", {
+                body: { transcript: editingClip.transcript, clipStart: editingClip.start, clipEnd: editingClip.end, style },
+              });
+              return data?.captions || [];
+            }
+            return [];
+          }}
+        />
+      </Suspense>
     </>
   );
 }
