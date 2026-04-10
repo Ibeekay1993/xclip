@@ -11,6 +11,7 @@ type Segment = { start: number; end: number; text: string };
 function parseVideoUrl(url: string): ParsedUrl | null {
   try {
     const urlObj = new URL(url);
+    const pathname = urlObj.pathname.toLowerCase();
 
     if (urlObj.hostname.includes("youtube.com") || urlObj.hostname.includes("youtu.be")) {
       let videoId = urlObj.searchParams.get("v");
@@ -44,7 +45,12 @@ function parseVideoUrl(url: string): ParsedUrl | null {
       if (match) return { platform: "tiktok", videoId: match[1] };
     }
 
-    if (/\.(mp4|mov|webm|m4v)(\?|#|$)/i.test(urlObj.pathname)) {
+    if (
+      /\.(mp4|mov|webm|m4v|mkv|avi|quicktime)(\?|#|$)/i.test(urlObj.pathname) ||
+      urlObj.hostname.includes("supabase.co") ||
+      pathname.includes("/storage/v1/object/public/") ||
+      pathname.includes("/storage/v1/object/sign/")
+    ) {
       return { platform: "direct", videoId: urlObj.pathname.split("/").pop() || "uploaded-video" };
     }
 
@@ -187,6 +193,51 @@ async function generateFallbackTranscript(platform: string, videoId: string, vid
   return { transcript, segments, duration: approxDuration };
 }
 
+function buildHeuristicTranscript(
+  platform: string,
+  videoId: string,
+  videoUrl: string,
+  metadata: { title: string | null; description: string | null; thumbnailUrl: string | null }
+) {
+  const sourceText = [
+    metadata.title || "",
+    metadata.description || "",
+    platform,
+    videoId,
+    videoUrl,
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const keywords = Array.from(
+    new Set(
+      sourceText
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter((word) => word.length > 2)
+    )
+  ).slice(0, 24);
+
+  const hooks = ["wait", "watch", "secret", "why", "how", "top", "best", "hack", "moment", "clip", "insane", "wild"];
+  const base = keywords.length > 0 ? keywords : [platform, "highlight", "reaction", "moment", "hook"];
+
+  const segments: Segment[] = base.map((word, index) => {
+    const start = index * 7;
+    const hook = hooks[index % hooks.length];
+    return {
+      start,
+      end: start + 7,
+      text: `${word} ${hook}`,
+    };
+  });
+
+  return {
+    transcript: segments.map((segment) => `${formatTime(segment.start)} - ${segment.text}`).join("\n"),
+    segments,
+    duration: Math.max(segments.length * 7, platform === "kick" ? 900 : 600),
+  };
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -224,7 +275,7 @@ serve(async (req) => {
       }
     }
 
-    const fallbackData = await generateFallbackTranscript(parsed.platform, parsed.videoId, videoUrl, metadata);
+    const fallbackData = buildHeuristicTranscript(parsed.platform, parsed.videoId, videoUrl, metadata);
 
     return new Response(
       JSON.stringify({

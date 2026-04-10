@@ -25,39 +25,116 @@ function parseTimeToSeconds(value: unknown): number {
   return 0;
 }
 
+type TranscriptSegment = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+function normalizeTranscriptInput(transcript: unknown): TranscriptSegment[] {
+  if (Array.isArray(transcript)) {
+    return transcript
+      .map((segment) => ({
+        start: parseTimeToSeconds((segment as any)?.start),
+        end: Math.max(parseTimeToSeconds((segment as any)?.end), parseTimeToSeconds((segment as any)?.start) + 1),
+        text: String((segment as any)?.text || "").trim(),
+      }))
+      .filter((segment) => segment.text.length > 0);
+  }
+
+  if (typeof transcript !== "string") return [];
+
+  return transcript
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const [timePart, ...rest] = line.split(" - ");
+      const start = parseTimeToSeconds(timePart || index * 8);
+      const text = rest.join(" - ").trim();
+      return {
+        start,
+        end: start + Math.max(10, Math.min(45, 10 + text.split(/\s+/).filter(Boolean).length * 1.5)),
+        text,
+      };
+    })
+    .filter((segment) => segment.text.length > 0);
+}
+
+function scoreSegment(text: string): number {
+  const lower = text.toLowerCase();
+  const hooks = [
+    "wait for it",
+    "you won't believe",
+    "secret",
+    "watch",
+    "why",
+    "how",
+    "top",
+    "best",
+    "hack",
+    "insane",
+    "wild",
+    "moment",
+    "clip",
+    "reaction",
+  ];
+  const questionBoost = lower.includes("?") ? 10 : 0;
+  const hookBoost = hooks.reduce((count, hook) => count + (lower.includes(hook) ? 1 : 0), 0) * 12;
+  const lengthBoost = Math.min(15, lower.split(/\s+/).filter(Boolean).length);
+  const intensityBoost = /\b(oh|wow|holy|damn|crazy|brutal|amazing|incredible)\b/.test(lower) ? 8 : 0;
+  return Math.max(35, Math.min(100, 40 + hookBoost + questionBoost + lengthBoost + intensityBoost));
+}
+
+function makeClipReason(text: string): string {
+  const lower = text.toLowerCase();
+  if (lower.includes("?")) return "Question-driven engagement moment";
+  if (lower.includes("wait") || lower.includes("secret") || lower.includes("watch")) return "Hook phrase detected";
+  if (lower.includes("wow") || lower.includes("holy") || lower.includes("crazy")) return "High-energy reaction moment";
+  return "Strong self-contained highlight";
+}
+
+function suppressOverlaps<T extends { start_time: number; end_time: number; hook_score: number }>(clips: T[]): T[] {
+  const sorted = [...clips].sort((a, b) => b.hook_score - a.hook_score || a.start_time - b.start_time);
+  const kept: T[] = [];
+
+  for (const clip of sorted) {
+    const overlaps = kept.some((existing) => !(clip.end_time <= existing.start_time + 3 || clip.start_time >= existing.end_time - 3));
+    if (!overlaps) kept.push(clip);
+  }
+
+  return kept.sort((a, b) => a.start_time - b.start_time);
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
   try {
     const { transcript, clipCount = 5 } = await req.json();
-    if (!transcript || typeof transcript !== "string") throw new Error("Transcript is required");
-    const lines = transcript
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
+    const segments = normalizeTranscriptInput(transcript);
+    if (segments.length === 0) throw new Error("Transcript is required");
 
-    const segments = lines.map((line, index) => {
-      const [timePart, ...rest] = line.split(" - ");
-      const start = parseTimeToSeconds(timePart || index * 8);
-      const text = rest.join(" - ").trim();
-      const words = text.split(/\s+/).filter(Boolean);
-      const hookWords = ["wait", "secret", "why", "how", "best", "top", "hack", "shock", "wild", "insane", "clip", "moment"];
-      const hookHits = words.reduce((count, word) => count + (hookWords.some((h) => word.toLowerCase().includes(h)) ? 1 : 0), 0);
-      const score = Math.max(35, Math.min(100, 45 + hookHits * 10 + Math.min(words.length, 12)));
+    const scoredSegments = segments.map((segment, index) => {
+      const score = scoreSegment(segment.text);
+      const duration = Math.max(12, Math.min(60, segment.end - segment.start));
+      const startPadding = index === 0 ? 0 : 1.5;
       return {
-        start,
-        end: start + Math.min(45, Math.max(12, 12 + words.length * 2)),
-        reason: hookHits > 0 ? "Hook keywords detected" : "Engaging segment",
+        start_time: Number(Math.max(0, segment.start - startPadding).toFixed(2)),
+        end_time: Number((segment.start - startPadding + duration).toFixed(2)),
+        reason: makeClipReason(segment.text),
         hook_score: score,
-        transcript: text,
+        transcript: segment.text,
       };
     });
 
-    const formattedClips = segments
-      .slice(0, clipCount)
+    const formattedClips = suppressOverlaps(
+      scoredSegments
+        .filter((clip) => clip.end_time > clip.start_time)
+        .slice(0, Math.max(1, Number(clipCount) || 5))
+    )
       .map((clip, index) => {
-        const start = Math.max(0, clip.start);
-        let end = Math.max(start + 12, clip.end);
+        const start = Math.max(0, clip.start_time);
+        let end = Math.max(start + 12, clip.end_time);
         if (end - start > 60) end = start + 60;
         return {
           clip_number: index + 1,

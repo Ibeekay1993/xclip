@@ -5,108 +5,84 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+type CaptionBlock = {
+  start: number;
+  end: number;
+  text: string;
+  emphasis: boolean;
+};
+
+function parseTime(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, value);
+  if (typeof value === "string") {
+    const asNumber = Number(value);
+    if (Number.isFinite(asNumber)) return Math.max(0, asNumber);
+  }
+  return 0;
+}
+
+function chunkWords(text: string, size = 4): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  const chunks: string[] = [];
+  for (let i = 0; i < words.length; i += size) {
+    chunks.push(words.slice(i, i + size).join(" "));
+  }
+  return chunks;
+}
+
+function buildCaptions(transcript: string, clipStart: number, clipEnd: number, style: string): CaptionBlock[] {
+  const plainText = transcript
+    .replace(/^\d{1,2}:\d{2}(?::\d{2})?\s*-\s*/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!plainText) return [];
+
+  const chunks = chunkWords(plainText, style === "viral" ? 3 : 4);
+  const duration = Math.max(8, clipEnd - clipStart);
+  const blockDuration = Math.max(1.3, Math.min(4, duration / Math.max(1, chunks.length)));
+
+  return chunks.map((chunk, index) => {
+    const start = index * blockDuration;
+    const end = Math.min(duration, start + blockDuration);
+    const emphasis = /(!|\?|wait|secret|wow|insane|crazy|best|top|hack)/i.test(chunk);
+    return {
+      start: Number(start.toFixed(2)),
+      end: Number(end.toFixed(2)),
+      text: style === "meme" ? chunk.toUpperCase() : chunk,
+      emphasis,
+    };
+  });
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return new Response("ok", { headers: corsHeaders });
   }
 
   try {
-    const { transcript, clipStart, clipEnd, style = "default" } = await req.json();
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-
-    if (!LOVABLE_API_KEY) {
-      throw new Error("LOVABLE_API_KEY is not configured");
-    }
-
-    if (!transcript) {
+    const { transcript, clipStart = 0, clipEnd = 30, style = "default" } = await req.json();
+    if (typeof transcript !== "string" || transcript.trim().length === 0) {
       throw new Error("Transcript is required");
     }
 
-    console.log("Generating captions for clip:", clipStart, "-", clipEnd);
-
-    const stylePrompts: Record<string, string> = {
-      default: "Standard captions with proper punctuation and timing",
-      viral: "SHORT, PUNCHY captions with EMPHASIS on key words. Use ALL CAPS for important phrases. Maximum impact.",
-      minimal: "Clean, simple captions. One thought per line. No filler words.",
-      storytelling: "Flowing narrative captions that build suspense and engagement. Add '...' for dramatic pauses.",
-      meme: "Casual, internet-style captions. Include reactions like 'wait for it...', 'no way 😱', 'this is insane'",
-    };
-
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-flash",
-        messages: [
-          {
-            role: "system",
-            content: `You are a professional caption generator for viral short-form video content.
-
-Style: ${stylePrompts[style] || stylePrompts.default}
-
-Generate captions that:
-1. Are perfectly timed for each phrase (2-5 words per caption block)
-2. Use natural reading rhythm
-3. Emphasize key words and phrases
-4. Are optimized for TikTok/Reels/Shorts viewing
-5. Include proper timing relative to clip start
-
-Return ONLY valid JSON array:
-[
-  {
-    "start": <seconds from clip start>,
-    "end": <seconds from clip start>,
-    "text": "caption text",
-    "emphasis": true/false (highlight this caption)
-  }
-]`
-          },
-          {
-            role: "user",
-            content: `Generate ${style} style captions for this transcript segment (clip from ${clipStart}s to ${clipEnd}s):
-
-${transcript}
-
-Break into short, readable caption blocks with proper timing.`
-          }
-        ],
-        temperature: 0.3,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`AI API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || "";
-
-    let captions = [];
-    try {
-      const jsonMatch = content.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        captions = JSON.parse(jsonMatch[0]);
-      }
-    } catch (e) {
-      console.error("Failed to parse captions:", e);
-      throw new Error("Failed to generate captions");
-    }
-
-    console.log("Generated", captions.length, "caption blocks");
+    const safeStart = parseTime(clipStart);
+    const safeEnd = Math.max(safeStart + 1, parseTime(clipEnd));
+    const captions = buildCaptions(transcript, safeStart, safeEnd, String(style));
 
     return new Response(
-      JSON.stringify({ success: true, captions }),
+      JSON.stringify({
+        success: true,
+        captions,
+      }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (error) {
     console.error("Error generating captions:", error);
     return new Response(
-      JSON.stringify({ 
-        success: false, 
-        error: error instanceof Error ? error.message : "Unknown error" 
+      JSON.stringify({
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
       }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );

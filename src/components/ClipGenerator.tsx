@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Link, Download, Wand2, FileAudio, Scissors, Sparkles, Settings, Upload, Layers, Zap } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -35,6 +35,15 @@ interface Clip {
   captions?: any[];
   exportPreset?: string;
   platform?: string;
+}
+
+interface RecentJob {
+  id: string;
+  video_url: string;
+  video_title: string | null;
+  status: string;
+  error_message: string | null;
+  created_at: string;
 }
 
 const formatTime = (seconds: number): string => {
@@ -96,8 +105,13 @@ export function ClipGenerator() {
   const [sourceType, setSourceType] = useState<"url" | "upload">("url");
   const [sourcePlatform, setSourcePlatform] = useState("youtube");
   const [transcriptData, setTranscriptData] = useState<{ transcript: string; segments: TranscriptSegment[] } | null>(null);
+  const [recentJobs, setRecentJobs] = useState<RecentJob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+
+  useEffect(() => {
+    void loadRecentJobs();
+  }, []);
 
   const processVideo = async (videoUrl?: string, inputType: "url" | "upload" = "url") => {
     const targetUrl = (videoUrl || url).trim();
@@ -197,6 +211,7 @@ export function ClipGenerator() {
 
       setClips(generatedClips);
       setStatus((s) => ({ ...s, generate: "complete" }));
+      void loadRecentJobs();
 
       toast({
         title: "Analysis Complete",
@@ -272,6 +287,18 @@ export function ClipGenerator() {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(blobUrl);
+  };
+
+  const loadRecentJobs = async () => {
+    const { data, error } = await supabase
+      .from("clip_jobs")
+      .select("id, video_url, video_title, status, error_message, created_at")
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    if (!error && data) {
+      setRecentJobs(data as RecentJob[]);
+    }
   };
 
   const createClipJob = async (videoUrl: string, videoTitle?: string, uploadedFileUrl?: string) => {
@@ -482,6 +509,45 @@ export function ClipGenerator() {
               <WorkflowStep icon={Sparkles} title="Viral Detection" description="Finding hooks and viral moments" status={status.analyze} />
               <WorkflowStep icon={Scissors} title="Generate Clips" description="Creating clip data and thumbnails" status={status.generate} isLast />
             </div>
+          </GlassCard>
+
+          <GlassCard>
+            <h2 className="text-sm font-bold uppercase tracking-widest orbitron mb-6 flex items-center gap-2">
+              <Layers className="w-4 h-4 text-primary" />
+              Recent Jobs
+              <Button variant="ghost" size="sm" className="ml-auto h-7 text-[10px]" onClick={() => void loadRecentJobs()}>
+                Refresh
+              </Button>
+            </h2>
+
+            {recentJobs.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No recent jobs yet. Analyze a clip and it will appear here with its latest processing status.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {recentJobs.map((job) => (
+                  <div key={job.id} className="rounded-sm border border-border bg-muted/30 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[10px] uppercase tracking-wider text-foreground truncate">
+                          {job.video_title || job.video_url}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground mono">
+                          {new Date(job.created_at).toLocaleString()}
+                        </p>
+                      </div>
+                      <span className="text-[10px] px-2 py-1 rounded-sm border border-border uppercase tracking-wider">
+                        {job.status}
+                      </span>
+                    </div>
+                    {job.error_message && (
+                      <p className="mt-2 text-[10px] text-destructive line-clamp-2">{job.error_message}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </GlassCard>
         </div>
 

@@ -14,53 +14,66 @@ export type ExportClipRequest = {
 };
 
 export async function exportClipFromBackend(request: ExportClipRequest): Promise<Blob> {
-  const response = await fetch(`${API_URL}/export`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      videoUrl: request.videoUrl,
-      video_url: request.videoUrl,
-      url: request.videoUrl,
-      source_url: request.videoUrl,
-      start: request.start,
-      start_time: request.start,
-      end: request.end,
-      end_time: request.end,
-      captions: request.captions ?? false,
-      add_subtitles: request.captions ?? false,
-      preset: request.preset ?? "9:16",
-      export_preset: request.preset ?? "9:16",
-      clipNumber: request.clipNumber ?? 1,
-      clip_number: request.clipNumber ?? 1,
-      title: request.title ?? "",
-    }),
-  });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 10 * 60 * 1000);
 
-  const contentType = response.headers.get("content-type") || "";
+  try {
+    const response = await fetch(`${API_URL}/export`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        videoUrl: request.videoUrl,
+        video_url: request.videoUrl,
+        url: request.videoUrl,
+        source_url: request.videoUrl,
+        start: request.start,
+        start_time: request.start,
+        end: request.end,
+        end_time: request.end,
+        captions: request.captions ?? false,
+        add_subtitles: request.captions ?? false,
+        preset: request.preset ?? "9:16",
+        export_preset: request.preset ?? "9:16",
+        clipNumber: request.clipNumber ?? 1,
+        clip_number: request.clipNumber ?? 1,
+        title: request.title ?? "",
+      }),
+    });
 
-  if (!response.ok) {
+    const contentType = response.headers.get("content-type") || "";
+
+    if (!response.ok) {
+      if (contentType.includes("application/json")) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.error || `Export failed with status ${response.status}`);
+      }
+
+      const text = await response.text().catch(() => "");
+      throw new Error(text || `Export failed with status ${response.status}`);
+    }
+
     if (contentType.includes("application/json")) {
-      const data = await response.json().catch(() => null);
-      throw new Error(data?.error || `Export failed with status ${response.status}`);
+      const data = await response.json();
+      if (data?.error) throw new Error(data.error);
+      const downloadUrl = data?.downloadUrl || data?.download_url || data?.file_url;
+      if (downloadUrl) {
+        const fileResponse = await fetch(downloadUrl);
+        if (!fileResponse.ok) throw new Error(`Download URL failed with status ${fileResponse.status}`);
+        return fileResponse.blob();
+      }
+      throw new Error("Export API returned JSON instead of a video file.");
     }
 
-    const text = await response.text().catch(() => "");
-    throw new Error(text || `Export failed with status ${response.status}`);
-  }
-
-  if (contentType.includes("application/json")) {
-    const data = await response.json();
-    if (data?.error) throw new Error(data.error);
-    const downloadUrl = data?.downloadUrl || data?.download_url || data?.file_url;
-    if (downloadUrl) {
-      const fileResponse = await fetch(downloadUrl);
-      if (!fileResponse.ok) throw new Error(`Download URL failed with status ${fileResponse.status}`);
-      return fileResponse.blob();
+    return response.blob();
+  } catch (error) {
+    if ((error as Error).name === "AbortError") {
+      throw new Error("Export timed out while rendering the clip.");
     }
-    throw new Error("Export API returned JSON instead of a video file.");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
   }
-
-  return response.blob();
 }
