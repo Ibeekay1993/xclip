@@ -1,0 +1,13 @@
+project_id = "cgwlmqhdmcmkxkyoqiix"
+
+[functions.analyze-clips]
+verify_jwt = false
+
+[functions.fetch-transcript]
+verify_jwt = false
+
+[functions.generate-captions]
+verify_jwt = false
+
+[functions.generate-thumbnail]
+verify_jwt = false
