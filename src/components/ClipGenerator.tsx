@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState, useRef } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Link, Download, Wand2, FileAudio, Scissors, Sparkles, Settings, Upload, Layers, Zap } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -41,6 +41,7 @@ interface Clip {
 
 interface RecentJob {
   id: string;
+  source_video_id: string | null;
   video_url: string;
   video_title: string | null;
   status: string;
@@ -62,10 +63,7 @@ const formatTime = (seconds: number): string => {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 };
 
-const formatDuration = (start: number, end: number): string => {
-  const duration = Math.max(0, end - start);
-  return `${Math.floor(duration)}s`;
-};
+const formatDuration = (start: number, end: number): string => `${Math.floor(Math.max(0, end - start))}s`;
 
 const getPlatformDefaultPreset = (platform: string): string => {
   if (platform === "youtube" || platform === "twitch" || platform === "kick") return "16:9";
@@ -76,7 +74,7 @@ const normalizeClipWindow = (startRaw: number, endRaw: number, maxDuration = 900
   const safeStart = Number.isFinite(startRaw) ? Math.max(0, startRaw) : 0;
   const safeEndInput = Number.isFinite(endRaw) ? Math.max(safeStart + 1, endRaw) : safeStart + 20;
   const boundedEnd = Math.min(safeEndInput, Math.max(1, maxDuration));
-  let duration = boundedEnd - safeStart;
+  const duration = boundedEnd - safeStart;
 
   if (duration < 12) {
     const adjustedEnd = Math.min(maxDuration, safeStart + 18);
@@ -98,22 +96,22 @@ const inferPlatformFromUrl = (sourceUrl: string): string => {
     if (host.includes("twitch")) return "twitch";
     if (host.includes("tiktok")) return "tiktok";
   } catch {
-    // fall through
+    return "youtube";
   }
+
   return "youtube";
 };
 
 const buildTranscriptText = (segments: TranscriptSegment[]): string =>
   segments.map((segment) => `${formatTime(segment.start)} - ${segment.text}`).join("\n");
 
-const buildClipTranscript = (segments: TranscriptSegment[], start: number, end: number): string => {
-  const words = segments
+const buildClipTranscript = (segments: TranscriptSegment[], start: number, end: number): string =>
+  segments
     .filter((segment) => segment.start >= start && segment.start <= end)
     .map((segment) => segment.text)
-    .filter(Boolean);
-
-  return words.join(" ").trim();
-};
+    .filter(Boolean)
+    .join(" ")
+    .trim();
 
 export function ClipGenerator() {
   const [url, setUrl] = useState("");
@@ -149,7 +147,7 @@ export function ClipGenerator() {
   const loadRecentJobs = useCallback(async () => {
     const { data, error } = await supabase
       .from("clip_jobs")
-      .select("id, video_url, video_title, status, error_message, created_at")
+      .select("id, source_video_id, video_url, video_title, status, error_message, created_at")
       .order("created_at", { ascending: false })
       .limit(5);
 
@@ -173,305 +171,6 @@ export function ClipGenerator() {
     return () => window.clearInterval(interval);
   }, [isProcessing, recentJobs, loadRecentJobs]);
 
-  const processVideo = async (videoUrl?: string, inputType: "url" | "upload" = "url", file?: File) => {
-    const targetUrl = (videoUrl || url).trim();
-    if (!targetUrl) {
-      toast({ title: "URL Required", description: "Please enter a valid video URL", variant: "destructive" });
-      return;
-    }
-
-    if (inputType === "url" || inputType === "upload") {
-      setIsProcessing(true);
-      setClips([]);
-      setTranscriptData(null);
-      setSourceUrl(targetUrl);
-      setSourcePlaybackUrl("");
-      setSourceVideoId("");
-      setSourceType(inputType);
-
-      let jobId: string | null = null;
-      try {
-        jobId = await createClipJob(targetUrl, undefined, inputType === "upload" ? "uploaded-file" : undefined);
-        setStatus((s) => ({ ...s, download: "processing" }));
-        if (jobId) await updateClipJobStatus(jobId, "downloading");
-
-        let backendVideoId = "";
-        let processResult: Awaited<ReturnType<typeof processVideoFromBackend>> | Awaited<ReturnType<typeof analyzeVideoFromBackend>>;
-
-        if (inputType === "upload") {
-          if (!file) throw new Error("Please select a video file to upload.");
-          const uploadResult = await uploadVideoToBackend(file);
-          backendVideoId = uploadResult.video_id;
-          const playbackUrl = getBackendVideoUrl(backendVideoId);
-          setSourceVideoId(backendVideoId);
-          setSourcePlaybackUrl(playbackUrl);
-          setSourcePlatform("upload");
-          setStatus((s) => ({ ...s, download: "complete", transcribe: "processing" }));
-          if (jobId) await updateClipJobStatus(jobId, "transcribing");
-          processResult = await analyzeVideoFromBackend(backendVideoId);
-        } else {
-          processResult = await processVideoFromBackend({ url: targetUrl });
-          backendVideoId = processResult.video_id;
-          const playbackUrl = getBackendVideoUrl(backendVideoId);
-          setSourceVideoId(backendVideoId);
-          setSourcePlaybackUrl(playbackUrl);
-          setSourcePlatform(inferPlatformFromUrl(targetUrl));
-          setStatus((s) => ({ ...s, download: "complete", transcribe: "processing" }));
-          if (jobId) await updateClipJobStatus(jobId, "transcribing");
-        }
-
-        const transcriptionSegments = Array.isArray(processResult.transcription)
-          ? processResult.transcription
-              .map((segment) => ({
-                start: Number((segment as any).start ?? 0),
-                end: Number((segment as any).end ?? 0),
-                text: String((segment as any).text ?? ""),
-              }))
-              .filter((segment) => segment.text.length > 0)
-          : [];
-
-        const transcriptText = buildTranscriptText(transcriptionSegments);
-        setTranscriptData({ transcript: transcriptText, segments: transcriptionSegments });
-
-        setStatus((s) => ({ ...s, transcribe: "complete", analyze: "processing" }));
-        if (jobId) await updateClipJobStatus(jobId, "analyzing");
-
-        const backendClips = Array.isArray(processResult.clips) ? processResult.clips : [];
-        const detectedDuration = Number(processResult.duration || transcriptionSegments[transcriptionSegments.length - 1]?.end || 900);
-        const platform = inputType === "upload" ? "youtube" : inferPlatformFromUrl(targetUrl);
-        const defaultPreset = getPlatformDefaultPreset(platform);
-
-        setStatus((s) => ({ ...s, analyze: "complete", generate: "processing" }));
-        if (jobId) await updateClipJobStatus(jobId, "generating");
-
-        const generatedClips: Clip[] = backendClips.map((clip: any, index: number) => {
-          const startValue = Number(clip.start ?? clip.start_time ?? 0);
-          const endValue = Number(clip.end ?? clip.end_time ?? 0);
-          const normalized = normalizeClipWindow(startValue, endValue, detectedDuration);
-          const clipTranscript = clip.transcript || buildClipTranscript(transcriptionSegments, normalized.start, normalized.end);
-
-          return {
-            id: `clip-${Date.now()}-${index}`,
-            jobId: jobId || undefined,
-            sourceVideoId: backendVideoId || undefined,
-            clipNumber: Number(clip.clip_number || index + 1),
-            start: normalized.start,
-            end: normalized.end,
-            reason: String(clip.reason || "Strong self-contained highlight"),
-            hookScore: Number(clip.hook_score || 70),
-            transcript: clipTranscript,
-            thumbnailUrl: "/placeholder.svg",
-            exportPreset: defaultPreset,
-            platform,
-          };
-        });
-
-        if (jobId) {
-          await saveGeneratedClips(jobId, generatedClips, inputType, getBackendVideoUrl(backendVideoId) || targetUrl);
-          await updateClipJobStatus(jobId, "complete");
-        }
-
-        setClips(generatedClips);
-        setStatus((s) => ({ ...s, generate: "complete" }));
-        void loadRecentJobs();
-
-        toast({
-          title: "Analysis Complete",
-          description: `${generatedClips.length} viral clips detected from ${platform}${targetUrl ? ` • ${targetUrl}` : ""}`,
-        });
-      } catch (error) {
-        console.error("Processing error:", error);
-        if (jobId) {
-          try {
-            await updateClipJobStatus(jobId, "error", error instanceof Error ? error.message : "An error occurred");
-          } catch {
-            // Best effort only.
-          }
-        }
-        setStatus((s) => ({
-          ...s,
-          download: s.download === "processing" ? "error" : s.download,
-          transcribe: s.transcribe === "processing" ? "error" : s.transcribe,
-          analyze: s.analyze === "processing" ? "error" : s.analyze,
-          generate: s.generate === "processing" ? "error" : s.generate,
-        }));
-        toast({
-          title: "Processing Failed",
-          description: error instanceof Error ? error.message : "An error occurred",
-          variant: "destructive",
-        });
-      } finally {
-        setIsProcessing(false);
-      }
-      return;
-    }
-
-    setIsProcessing(true);
-    setClips([]);
-    setSourceUrl(targetUrl);
-    setSourceType(inputType);
-
-    let jobId: string | null = null;
-
-    try {
-      jobId = await createClipJob(targetUrl, undefined, inputType === "upload" ? targetUrl : undefined);
-      setStatus((s) => ({ ...s, download: "processing" }));
-      if (jobId) await updateClipJobStatus(jobId, "downloading");
-      await new Promise((r) => setTimeout(r, 250));
-      setStatus((s) => ({ ...s, download: "complete", transcribe: "processing" }));
-
-      const transcriptResult = await supabase.functions.invoke("fetch-transcript", {
-        body: { videoUrl: targetUrl },
-      });
-
-      if (transcriptResult.error || !transcriptResult.data?.success) {
-        throw new Error(transcriptResult.data?.error || transcriptResult.error?.message || "Failed to get transcript");
-      }
-
-      const { transcript, segments, platform, fallback, duration, metadata } = transcriptResult.data;
-      setSourcePlatform(platform);
-      setTranscriptData({ transcript, segments });
-      if (jobId) await updateClipJobStatus(jobId, "transcribing");
-
-      if (fallback) {
-        toast({
-          title: "Estimated transcript",
-          description: "No public captions found. Clip timestamps are AI-estimated. Upload the video for precise cuts.",
-        });
-      }
-
-      setStatus((s) => ({ ...s, transcribe: "complete", analyze: "processing" }));
-      if (jobId) await updateClipJobStatus(jobId, "analyzing");
-
-      const { data, error } = await supabase.functions.invoke("analyze-clips", {
-        body: { transcript, clipCount, videoUrl: targetUrl },
-      });
-
-      if (error) throw new Error(error.message || "Failed to analyze clips");
-      if (data.error) throw new Error(data.error);
-
-      setStatus((s) => ({ ...s, analyze: "complete", generate: "processing" }));
-      if (jobId) await updateClipJobStatus(jobId, "generating");
-
-      const detectedDuration = Number.isFinite(duration)
-        ? Number(duration)
-        : segments[segments.length - 1]?.end || 900;
-      const defaultPreset = getPlatformDefaultPreset(platform);
-
-      const generatedClips: Clip[] = await Promise.all(
-        data.clips.map(async (clip: any, index: number) => {
-          const normalized = normalizeClipWindow(Number(clip.start_time), Number(clip.end_time), detectedDuration);
-
-          let thumbnailUrl = metadata?.thumbnailUrl || "";
-          if (!thumbnailUrl) {
-            try {
-              const thumbResult = await supabase.functions.invoke("generate-thumbnail", {
-                body: { videoUrl: targetUrl, clipNumber: clip.clip_number || index + 1, platform },
-              });
-              if (thumbResult.data?.thumbnailUrl) thumbnailUrl = thumbResult.data.thumbnailUrl;
-            } catch {
-              thumbnailUrl = "/placeholder.svg";
-            }
-          }
-
-          return {
-            id: `clip-${Date.now()}-${index}`,
-            jobId: jobId || undefined,
-            clipNumber: clip.clip_number || index + 1,
-            start: normalized.start,
-            end: normalized.end,
-            reason: clip.reason,
-            hookScore: clip.hook_score,
-            transcript: clip.transcript,
-            thumbnailUrl: thumbnailUrl || "/placeholder.svg",
-            exportPreset: defaultPreset,
-            platform,
-          };
-        })
-      );
-
-      if (jobId) {
-        await saveGeneratedClips(jobId, generatedClips, inputType, targetUrl);
-        await updateClipJobStatus(jobId, "complete");
-      }
-
-      setClips(generatedClips);
-      setStatus((s) => ({ ...s, generate: "complete" }));
-      void loadRecentJobs();
-
-      toast({
-        title: "Analysis Complete",
-        description: `${generatedClips.length} viral clips detected from ${platform}${metadata?.title ? ` • ${metadata.title}` : ""}`,
-      });
-    } catch (error) {
-      console.error("Processing error:", error);
-      if (jobId) {
-        try {
-          await updateClipJobStatus(jobId, "error", error instanceof Error ? error.message : "An error occurred");
-        } catch {
-          // Best effort only.
-        }
-      }
-      setStatus((s) => ({
-        ...s,
-        download: s.download === "processing" ? "error" : s.download,
-        transcribe: s.transcribe === "processing" ? "error" : s.transcribe,
-        analyze: s.analyze === "processing" ? "error" : s.analyze,
-        generate: s.generate === "processing" ? "error" : s.generate,
-      }));
-      toast({
-        title: "Processing Failed",
-        description: error instanceof Error ? error.message : "An error occurred",
-        variant: "destructive",
-      });
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    if (!file.type.startsWith("video/")) {
-      toast({ title: "Invalid File", description: "Please upload a video file (MP4, WebM, etc.)", variant: "destructive" });
-      return;
-    }
-
-    setIsProcessing(true);
-    toast({ title: "Uploading Video", description: "Please wait while we upload your video..." });
-
-    try {
-      toast({ title: "Upload Complete", description: "Processing your video..." });
-      await processVideo(file.name, "upload", file);
-    } catch (error) {
-      console.error("Upload error:", error);
-      toast({ title: "Upload Failed", description: error instanceof Error ? error.message : "Failed to upload video", variant: "destructive" });
-      setIsProcessing(false);
-    }
-  };
-
-  const resetWorkflow = () => {
-    setStatus({ download: "idle", transcribe: "idle", analyze: "idle", generate: "idle" });
-    setClips([]);
-    setIsProcessing(false);
-    setSourceUrl("");
-    setSourcePlaybackUrl("");
-    setSourceVideoId("");
-    setSourceType("url");
-    setSourcePlatform("youtube");
-    setTranscriptData(null);
-  };
-
-  const downloadBlob = (blob: Blob, filename: string) => {
-    const blobUrl = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = blobUrl;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(blobUrl);
-  };
-
   const createClipJob = async (videoUrl: string, videoTitle?: string, uploadedFileUrl?: string) => {
     const { data, error } = await supabase
       .from("clip_jobs")
@@ -479,6 +178,7 @@ export function ClipGenerator() {
         video_url: videoUrl,
         video_title: videoTitle || null,
         uploaded_file_url: uploadedFileUrl || null,
+        source_video_id: null,
         status: "pending",
       })
       .select("id")
@@ -488,16 +188,23 @@ export function ClipGenerator() {
     return data.id as string;
   };
 
-  const updateClipJobStatus = async (jobId: string, status: string, errorMessage?: string) => {
-    const payload: { status: string; error_message?: string | null } = { status };
+  const updateClipJobStatus = async (jobId: string, nextStatus: string, errorMessage?: string) => {
+    const payload: { status: string; error_message?: string | null } = { status: nextStatus };
     if (errorMessage) payload.error_message = errorMessage;
     const { error } = await supabase.from("clip_jobs").update(payload).eq("id", jobId);
     if (error) throw error;
   };
 
-  const saveGeneratedClips = async (jobId: string, generatedClips: Clip[], sourceKind: "url" | "upload", sourceUrlValue: string) => {
+  const saveGeneratedClips = async (
+    jobId: string,
+    generatedClips: Clip[],
+    sourceKind: "url" | "upload",
+    sourceUrlValue: string,
+    backendVideoId?: string
+  ) => {
     const rows = generatedClips.map((clip) => ({
       job_id: jobId,
+      source_video_id: backendVideoId || clip.sourceVideoId || null,
       clip_number: clip.clipNumber,
       start_time: clip.start,
       end_time: clip.end,
@@ -516,6 +223,177 @@ export function ClipGenerator() {
     if (error) throw error;
   };
 
+  const processVideo = async (videoUrl?: string, inputType: "url" | "upload" = "url", file?: File) => {
+    const targetUrl = (videoUrl || url).trim();
+    if (inputType === "url" && !targetUrl) {
+      toast({ title: "URL Required", description: "Please enter a valid video URL", variant: "destructive" });
+      return;
+    }
+
+    setIsProcessing(true);
+    setClips([]);
+    setStatus({ download: "idle", transcribe: "idle", analyze: "idle", generate: "idle" });
+    setTranscriptData(null);
+    setSourceUrl(targetUrl);
+    setSourcePlaybackUrl("");
+    setSourceVideoId("");
+    setSourceType(inputType);
+
+    let jobId: string | null = null;
+    let backendVideoId = "";
+
+    try {
+      jobId = await createClipJob(targetUrl || file?.name || "uploaded-video", undefined, inputType === "upload" ? "uploaded-file" : undefined);
+
+      setStatus((current) => ({ ...current, download: "processing" }));
+      await updateClipJobStatus(jobId, "downloading");
+
+      if (inputType === "upload") {
+        if (!file) throw new Error("Please select a video file to upload.");
+        const uploadResult = await uploadVideoToBackend(file);
+        backendVideoId = uploadResult.video_id;
+        setSourcePlatform("upload");
+      } else {
+        const downloadResult = await processVideoFromBackend({ url: targetUrl });
+        backendVideoId = downloadResult.video_id;
+        setSourcePlatform(inferPlatformFromUrl(targetUrl));
+      }
+
+      const playbackUrl = getBackendVideoUrl(backendVideoId);
+      setSourceVideoId(backendVideoId);
+      setSourcePlaybackUrl(playbackUrl);
+      await supabase.from("clip_jobs").update({ source_video_id: backendVideoId }).eq("id", jobId);
+
+      setStatus((current) => ({ ...current, download: "complete", transcribe: "processing" }));
+      await updateClipJobStatus(jobId, "transcribing");
+
+      const analysisResult = await analyzeVideoFromBackend(backendVideoId);
+      const transcriptionSegments = Array.isArray(analysisResult.transcription)
+        ? analysisResult.transcription
+            .map((segment) => ({
+              start: Number((segment as any).start ?? 0),
+              end: Number((segment as any).end ?? 0),
+              text: String((segment as any).text ?? ""),
+            }))
+            .filter((segment) => segment.text.length > 0)
+        : [];
+
+      setTranscriptData({ transcript: buildTranscriptText(transcriptionSegments), segments: transcriptionSegments });
+      setStatus((current) => ({ ...current, transcribe: "complete", analyze: "processing" }));
+      await updateClipJobStatus(jobId, "analyzing");
+
+      const backendClips = Array.isArray(analysisResult.clips) ? analysisResult.clips : [];
+      const detectedDuration = Number(analysisResult.duration || transcriptionSegments[transcriptionSegments.length - 1]?.end || 900);
+      const platform = inputType === "upload" ? "upload" : inferPlatformFromUrl(targetUrl);
+      const defaultPreset = getPlatformDefaultPreset(platform === "upload" ? "youtube" : platform);
+
+      setStatus((current) => ({ ...current, analyze: "complete", generate: "processing" }));
+      await updateClipJobStatus(jobId, "generating");
+
+      const generatedClips: Clip[] = backendClips.slice(0, clipCount).map((clip: any, index: number) => {
+        const startValue = Number(clip.start ?? clip.start_time ?? 0);
+        const endValue = Number(clip.end ?? clip.end_time ?? 0);
+        const normalized = normalizeClipWindow(startValue, endValue, detectedDuration);
+
+        return {
+          id: `clip-${Date.now()}-${index}`,
+          jobId,
+          sourceVideoId: backendVideoId,
+          clipNumber: Number(clip.clip_number || index + 1),
+          start: normalized.start,
+          end: normalized.end,
+          reason: String(clip.reason || "Strong self-contained highlight"),
+          hookScore: Number(clip.hook_score || 70),
+          transcript: clip.transcript || buildClipTranscript(transcriptionSegments, normalized.start, normalized.end),
+          thumbnailUrl: "/placeholder.svg",
+          exportPreset: defaultPreset,
+          platform,
+        };
+      });
+
+      await saveGeneratedClips(jobId, generatedClips, inputType, playbackUrl, backendVideoId);
+      await updateClipJobStatus(jobId, "complete");
+
+      setClips(generatedClips);
+      setStatus((current) => ({ ...current, generate: "complete" }));
+      void loadRecentJobs();
+
+      toast({
+        title: "Analysis Complete",
+        description: `${generatedClips.length} viral clips detected from ${platform}${analysisResult.title ? ` - ${analysisResult.title}` : ""}`,
+      });
+    } catch (error) {
+      console.error("Processing error:", error);
+      if (jobId) {
+        try {
+          await updateClipJobStatus(jobId, "error", error instanceof Error ? error.message : "An error occurred");
+        } catch {
+          // Best effort only.
+        }
+      }
+
+      setStatus((current) => ({
+        ...current,
+        download: current.download === "processing" ? "error" : current.download,
+        transcribe: current.transcribe === "processing" ? "error" : current.transcribe,
+        analyze: current.analyze === "processing" ? "error" : current.analyze,
+        generate: current.generate === "processing" ? "error" : current.generate,
+      }));
+      toast({
+        title: "Processing Failed",
+        description: error instanceof Error ? error.message : "An error occurred",
+        variant: "destructive",
+      });
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith("video/")) {
+      toast({ title: "Invalid File", description: "Please upload a video file (MP4, WebM, etc.)", variant: "destructive" });
+      return;
+    }
+
+    toast({ title: "Uploading Video", description: "Please wait while we upload your video..." });
+
+    try {
+      await processVideo(file.name, "upload", file);
+    } catch (error) {
+      console.error("Upload error:", error);
+      toast({
+        title: "Upload Failed",
+        description: error instanceof Error ? error.message : "Failed to upload video",
+        variant: "destructive",
+      });
+      setIsProcessing(false);
+    }
+  };
+
+  const resetWorkflow = () => {
+    setStatus({ download: "idle", transcribe: "idle", analyze: "idle", generate: "idle" });
+    setClips([]);
+    setIsProcessing(false);
+    setSourceUrl("");
+    setSourcePlaybackUrl("");
+    setSourceVideoId("");
+    setSourceType("url");
+    setSourcePlatform("youtube");
+    setTranscriptData(null);
+  };
+
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const blobUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = blobUrl;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(blobUrl);
+  };
+
   const handleDownload = async (clip: Clip, format?: string) => {
     const preset = format || clip.exportPreset || "9:16";
     try {
@@ -527,10 +405,12 @@ export function ClipGenerator() {
 
       toast({
         title: "Rendering clip",
-        description: sourceType === "upload"
-          ? `Server-side FFmpeg is cutting your uploaded video...`
-          : `Server-side FFmpeg is creating clip #${clip.clipNumber}...`,
+        description:
+          sourceType === "upload"
+            ? "Server-side FFmpeg is cutting your uploaded video..."
+            : `Server-side FFmpeg is creating clip #${clip.clipNumber}...`,
       });
+
       const blob = await exportClipFromBackend({
         videoId: clip.sourceVideoId || sourceVideoId || undefined,
         videoUrl: source,
@@ -550,6 +430,7 @@ export function ClipGenerator() {
           .eq("job_id", clip.jobId)
           .eq("clip_number", clip.clipNumber);
       }
+
       toast({ title: "Clip ready", description: `Downloaded real MP4 clip #${clip.clipNumber}` });
     } catch (error) {
       toast({
@@ -567,10 +448,14 @@ export function ClipGenerator() {
         body: { transcript: clip.transcript, clipStart: clip.start, clipEnd: clip.end, style: "viral" },
       });
       if (error || !data?.success) throw new Error(data?.error || error?.message || "Failed");
-      setClips((prev) => prev.map((c) => c.id === clip.id ? { ...c, captions: data.captions } : c));
-      toast({ title: "Captions Generated!", description: `${data.captions.length} caption blocks created` });
+      setClips((previous) => previous.map((current) => (current.id === clip.id ? { ...current, captions: data.captions } : current)));
+      toast({ title: "Captions Generated", description: `${data.captions.length} caption blocks created` });
     } catch (error) {
-      toast({ title: "Caption Generation Failed", description: error instanceof Error ? error.message : "An error occurred", variant: "destructive" });
+      toast({
+        title: "Caption Generation Failed",
+        description: error instanceof Error ? error.message : "An error occurred",
+        variant: "destructive",
+      });
     }
   };
 
@@ -585,7 +470,6 @@ export function ClipGenerator() {
   return (
     <>
       <div className="grid lg:grid-cols-2 gap-6">
-        {/* Input Section */}
         <div className="space-y-6">
           <GlassCard neon>
             <div className="flex items-center justify-between mb-6">
@@ -611,7 +495,7 @@ export function ClipGenerator() {
                 <Input
                   placeholder="https://youtube.com/watch?v=... or https://kick.com/..."
                   value={url}
-                  onChange={(e) => setUrl(e.target.value)}
+                  onChange={(event) => setUrl(event.target.value)}
                   disabled={isProcessing}
                   className="bg-input border-border focus:border-primary focus:shadow-[0_0_15px_hsl(var(--primary)/0.2)] transition-shadow rounded-sm"
                 />
@@ -632,9 +516,7 @@ export function ClipGenerator() {
               </div>
 
               <div>
-                <label className="text-[10px] text-muted-foreground mb-2 block uppercase tracking-widest">
-                  Number of Clips
-                </label>
+                <label className="text-[10px] text-muted-foreground mb-2 block uppercase tracking-widest">Number of Clips</label>
                 <div className="flex gap-2">
                   {[3, 5, 7, 10].map((num) => (
                     <Button
@@ -669,7 +551,6 @@ export function ClipGenerator() {
             </div>
           </GlassCard>
 
-          {/* Pipeline Status */}
           <GlassCard>
             <h2 className="text-sm font-bold uppercase tracking-widest orbitron mb-6 flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-primary" />
@@ -693,29 +574,19 @@ export function ClipGenerator() {
             </h2>
 
             {recentJobs.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No recent jobs yet. Analyze a clip and it will appear here with its latest processing status.
-              </p>
+              <p className="text-xs text-muted-foreground">No recent jobs yet. Analyze a clip and it will appear here with its latest processing status.</p>
             ) : (
               <div className="space-y-2">
                 {recentJobs.map((job) => (
                   <div key={job.id} className="rounded-sm border border-border bg-muted/30 p-3">
                     <div className="flex items-center justify-between gap-3">
                       <div className="min-w-0">
-                        <p className="text-[10px] uppercase tracking-wider text-foreground truncate">
-                          {job.video_title || job.video_url}
-                        </p>
-                        <p className="text-[10px] text-muted-foreground mono">
-                          {new Date(job.created_at).toLocaleString()}
-                        </p>
+                        <p className="text-[10px] uppercase tracking-wider text-foreground truncate">{job.video_title || job.video_url}</p>
+                        <p className="text-[10px] text-muted-foreground mono">{new Date(job.created_at).toLocaleString()}</p>
                       </div>
-                      <span className="text-[10px] px-2 py-1 rounded-sm border border-border uppercase tracking-wider">
-                        {job.status}
-                      </span>
+                      <span className="text-[10px] px-2 py-1 rounded-sm border border-border uppercase tracking-wider">{job.status}</span>
                     </div>
-                    {job.error_message && (
-                      <p className="mt-2 text-[10px] text-destructive line-clamp-2">{job.error_message}</p>
-                    )}
+                    {job.error_message && <p className="mt-2 text-[10px] text-destructive line-clamp-2">{job.error_message}</p>}
                   </div>
                 ))}
               </div>
@@ -723,16 +594,13 @@ export function ClipGenerator() {
           </GlassCard>
         </div>
 
-        {/* Results Section */}
         <div>
           <GlassCard className="h-full">
             <h2 className="text-sm font-bold uppercase tracking-widest orbitron mb-6 flex items-center gap-2">
               <Scissors className="w-4 h-4 text-primary" />
               Detected Clips
               {clips.length > 0 && (
-                <span className="ml-auto text-[10px] text-muted-foreground font-normal mono">
-                  {clips.length} clips
-                </span>
+                <span className="ml-auto text-[10px] text-muted-foreground font-normal mono">{clips.length} clips</span>
               )}
             </h2>
 
@@ -742,9 +610,7 @@ export function ClipGenerator() {
                   <Scissors className="w-8 h-8 text-muted-foreground" />
                 </div>
                 <h3 className="text-sm font-bold uppercase tracking-wider text-foreground mb-2 orbitron">No Clips Yet</h3>
-                <p className="text-xs text-muted-foreground max-w-xs">
-                  Enter a video URL or upload a file to detect viral moments
-                </p>
+                <p className="text-xs text-muted-foreground max-w-xs">Enter a video URL or upload a file to detect viral moments</p>
               </div>
             ) : (
               <div className="space-y-3 max-h-[600px] overflow-y-auto pr-2">
@@ -771,7 +637,6 @@ export function ClipGenerator() {
         </div>
       </div>
 
-      {/* Modals */}
       <Suspense fallback={null}>
         <SettingsPanel isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
         <BatchProcessor isOpen={batchOpen} onClose={() => setBatchOpen(false)} onProcess={handleBatchProcess} />
@@ -790,36 +655,59 @@ export function ClipGenerator() {
           onClose={() => setPreviewClip(null)}
           videoUrl={sourcePlaybackUrl || sourceUrl || url}
           sourceUrl={sourceUrl || url}
-          clipData={previewClip ? {
-            id: previewClip.id,
-            clipNumber: previewClip.clipNumber,
-            startTime: previewClip.start,
-            endTime: previewClip.end,
-            reason: previewClip.reason,
-            transcript: previewClip.transcript,
-            captions: previewClip.captions,
-            exportPreset: previewClip.exportPreset,
-          } : null}
-          onEdit={() => { setEditingClip(previewClip); setPreviewClip(null); }}
-          onDownload={() => { if (previewClip) handleDownload(previewClip); }}
+          clipData={
+            previewClip
+              ? {
+                  id: previewClip.id,
+                  clipNumber: previewClip.clipNumber,
+                  startTime: previewClip.start,
+                  endTime: previewClip.end,
+                  reason: previewClip.reason,
+                  transcript: previewClip.transcript,
+                  captions: previewClip.captions,
+                  exportPreset: previewClip.exportPreset,
+                }
+              : null
+          }
+          onEdit={() => {
+            setEditingClip(previewClip);
+            setPreviewClip(null);
+          }}
+          onDownload={() => {
+            if (previewClip) handleDownload(previewClip);
+          }}
         />
 
         <ClipEditor
           isOpen={!!editingClip}
           onClose={() => setEditingClip(null)}
-          clipData={editingClip ? {
-            id: editingClip.id,
-            clipNumber: editingClip.clipNumber,
-            startTime: editingClip.start,
-            endTime: editingClip.end,
-            reason: editingClip.reason,
-            transcript: editingClip.transcript,
-            captions: editingClip.captions,
-            exportPreset: editingClip.exportPreset,
-          } : null}
+          clipData={
+            editingClip
+              ? {
+                  id: editingClip.id,
+                  clipNumber: editingClip.clipNumber,
+                  startTime: editingClip.start,
+                  endTime: editingClip.end,
+                  reason: editingClip.reason,
+                  transcript: editingClip.transcript,
+                  captions: editingClip.captions,
+                  exportPreset: editingClip.exportPreset,
+                }
+              : null
+          }
           onSave={(updated) => {
-            setClips(prev =>
-              prev.map(c => c.id === updated.id ? { ...c, start: updated.startTime, end: updated.endTime, captions: updated.captions, exportPreset: updated.aspectRatio } : c)
+            setClips((previous) =>
+              previous.map((clip) =>
+                clip.id === updated.id
+                  ? {
+                      ...clip,
+                      start: updated.startTime,
+                      end: updated.endTime,
+                      captions: updated.captions,
+                      exportPreset: updated.aspectRatio,
+                    }
+                  : clip
+              )
             );
           }}
           onGenerateCaptions={async (style) => {

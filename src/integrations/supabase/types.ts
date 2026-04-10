@@ -20,6 +20,7 @@ export type Database = {
           created_at: string
           error_message: string | null
           id: string
+          source_video_id: string | null
           status: string
           transcript_data: Json | null
           updated_at: string
@@ -33,6 +34,7 @@ export type Database = {
           created_at?: string
           error_message?: string | null
           id?: string
+          source_video_id?: string | null
           status?: string
           transcript_data?: Json | null
           updated_at?: string
@@ -46,6 +48,7 @@ export type Database = {
           created_at?: string
           error_message?: string | null
           id?: string
+          source_video_id?: string | null
           status?: string
           transcript_data?: Json | null
           updated_at?: string
@@ -70,6 +73,7 @@ export type Database = {
           id: string
           job_id: string
           reason: string
+          source_video_id: string | null
           source_type: string | null
           start_time: number
           thumbnail_url: string | null
@@ -89,6 +93,7 @@ export type Database = {
           id?: string
           job_id: string
           reason: string
+          source_video_id?: string | null
           source_type?: string | null
           start_time: number
           thumbnail_url?: string | null
@@ -108,6 +113,7 @@ export type Database = {
           id?: string
           job_id?: string
           reason?: string
+          source_video_id?: string | null
           source_type?: string | null
           start_time?: number
           thumbnail_url?: string | null

@@ -32,48 +32,70 @@ export type ProcessVideoResponse = {
   clips?: Array<Record<string, unknown>>;
   transcription?: Array<Record<string, unknown>>;
   source_url?: string;
+  title?: string;
   error?: string;
 };
 
-export async function processVideoFromBackend(request: ProcessVideoRequest): Promise<ProcessVideoResponse> {
-  const response = await fetch(`${API_URL}/process-url`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ url: request.url }),
-  });
+async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: number, label: string) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 
-  const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(data?.error || `Process failed with status ${response.status}`);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(data?.detail || data?.error || `${label} failed with status ${response.status}`);
+    }
+    return data;
+  } catch (error) {
+    if ((error as Error).name === "AbortError") {
+      throw new Error(`${label} timed out. The backend may still be waking up or processing the source video.`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
   }
-  return data as ProcessVideoResponse;
+}
+
+export async function processVideoFromBackend(request: ProcessVideoRequest): Promise<ProcessVideoResponse> {
+  return fetchJsonWithTimeout(
+    `${API_URL}/process-url`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ url: request.url }),
+    },
+    4 * 60 * 1000,
+    "Fetch video"
+  ) as Promise<ProcessVideoResponse>;
 }
 
 export async function uploadVideoToBackend(file: File): Promise<UploadVideoResponse> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch(`${API_URL}/upload`, {
-    method: "POST",
-    body: formData,
-  });
-
-  const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(data?.detail || data?.error || `Upload failed with status ${response.status}`);
-  }
-  return data as UploadVideoResponse;
+  return fetchJsonWithTimeout(
+    `${API_URL}/upload`,
+    {
+      method: "POST",
+      body: formData,
+    },
+    10 * 60 * 1000,
+    "Upload video"
+  ) as Promise<UploadVideoResponse>;
 }
 
 export async function analyzeVideoFromBackend(videoId: string): Promise<ProcessVideoResponse> {
-  const response = await fetch(`${API_URL}/analyze/${videoId}`);
-  const data = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(data?.detail || data?.error || `Analyze failed with status ${response.status}`);
-  }
-  return data as ProcessVideoResponse;
+  return fetchJsonWithTimeout(
+    `${API_URL}/analyze/${videoId}`,
+    {
+      method: "GET",
+    },
+    12 * 60 * 1000,
+    "Analyze video"
+  ) as Promise<ProcessVideoResponse>;
 }
 
 export function getBackendVideoUrl(videoId: string): string {
