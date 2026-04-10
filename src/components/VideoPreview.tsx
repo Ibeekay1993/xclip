@@ -1,4 +1,4 @@
-import { useState, useEffect, type CSSProperties } from "react";
+import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { Play, Pause, Volume2, VolumeX, Maximize, X, Edit3, Download, Type, ExternalLink } from "lucide-react";
 import { Button } from "./ui/button";
 import { Slider } from "./ui/slider";
@@ -15,6 +15,7 @@ interface VideoPreviewProps {
   isOpen: boolean;
   onClose: () => void;
   videoUrl?: string;
+  sourceUrl?: string;
   clipData: {
     id: string;
     clipNumber: number;
@@ -29,12 +30,13 @@ interface VideoPreviewProps {
   onDownload?: () => void;
 }
 
-export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDownload }: VideoPreviewProps) {
+export function VideoPreview({ isOpen, onClose, videoUrl, sourceUrl, clipData, onEdit, onDownload }: VideoPreviewProps) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [showCaptions, setShowCaptions] = useState(true);
   const [embedMode, setEmbedMode] = useState<"fit" | "fill">("fill");
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
     if (clipData) {
@@ -43,7 +45,6 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
     }
   }, [clipData]);
 
-  // Guard: must be after hooks
   if (!isOpen || !clipData) return null;
 
   const duration = clipData.endTime - clipData.startTime;
@@ -57,6 +58,50 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
   };
   const sourceRatio = 16 / 9;
   const embedScale = embedMode === "fill" ? Math.max(targetRatio / sourceRatio, sourceRatio / targetRatio) : 1;
+  const embedUrl = videoUrl ? getEmbedUrl(videoUrl) : null;
+  const playbackSource = videoUrl || "";
+
+  useEffect(() => {
+    if (embedUrl || !videoRef.current) return;
+    const video = videoRef.current;
+
+    const onLoaded = () => {
+      video.currentTime = clipData.startTime;
+      setCurrentTime(clipData.startTime);
+    };
+    const onTimeUpdate = () => {
+      setCurrentTime(video.currentTime);
+      if (video.currentTime >= clipData.endTime) {
+        video.pause();
+        setIsPlaying(false);
+      }
+    };
+    const onPlay = () => setIsPlaying(true);
+    const onPause = () => setIsPlaying(false);
+
+    video.addEventListener("loadedmetadata", onLoaded);
+    video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+
+    return () => {
+      video.removeEventListener("loadedmetadata", onLoaded);
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("play", onPlay);
+      video.removeEventListener("pause", onPause);
+    };
+  }, [clipData.endTime, clipData.startTime, embedUrl]);
+
+  useEffect(() => {
+    if (embedUrl || !videoRef.current) return;
+    const video = videoRef.current;
+    video.muted = isMuted;
+    if (isPlaying) {
+      void video.play().catch(() => setIsPlaying(false));
+    } else {
+      video.pause();
+    }
+  }, [embedUrl, isMuted, isPlaying]);
 
   const formatTime = (seconds: number): string => {
     const mins = Math.floor(seconds / 60);
@@ -71,8 +116,7 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
 
   const currentCaption = getCurrentCaption();
 
-  // YouTube embed URL
-  const getEmbedUrl = (url: string): string | null => {
+  function getEmbedUrl(url: string): string | null {
     if (!url) return null;
     try {
       const urlObj = new URL(url);
@@ -84,11 +128,33 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
         const videoId = urlObj.pathname.slice(1);
         return `https://www.youtube.com/embed/${videoId}?start=${Math.floor(clipData.startTime)}&end=${Math.floor(clipData.endTime)}&autoplay=0`;
       }
-    } catch { return null; }
+    } catch {
+      return null;
+    }
     return null;
+  }
+
+  const seekTo = (time: number) => {
+    if (embedUrl) return;
+    if (videoRef.current) {
+      videoRef.current.currentTime = time;
+      setCurrentTime(time);
+    }
   };
 
-  const embedUrl = videoUrl ? getEmbedUrl(videoUrl) : null;
+  const togglePlay = () => {
+    if (embedUrl) {
+      setIsPlaying((value) => !value);
+      return;
+    }
+    if (videoRef.current) {
+      if (videoRef.current.paused) {
+        void videoRef.current.play();
+      } else {
+        videoRef.current.pause();
+      }
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -96,7 +162,6 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
 
       <div className="relative z-10 w-full max-w-4xl">
         <GlassCard className="overflow-hidden border-primary/20" neon>
-          {/* Header */}
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-lg font-bold orbitron uppercase tracking-wider">
@@ -123,7 +188,6 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
             </div>
           </div>
 
-          {/* Video Player Area */}
           <div
             className={`relative mx-auto w-full ${targetRatio < 1 ? "max-w-md" : "max-w-4xl"} max-h-[60vh] bg-muted/30 rounded-sm overflow-hidden mb-4 border border-border`}
             style={aspectStyle}
@@ -141,25 +205,27 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
                   allowFullScreen
                 />
               </div>
+            ) : playbackSource ? (
+              <video
+                ref={videoRef}
+                src={playbackSource}
+                className="absolute inset-0 w-full h-full object-contain bg-black"
+                playsInline
+                muted={isMuted}
+                controls={false}
+              />
             ) : (
               <div className="absolute inset-0 flex flex-col items-center justify-center text-muted-foreground">
-                <div
-                  className="w-16 h-16 rounded-sm border border-primary/50 bg-primary/10 flex items-center justify-center mb-4 cursor-pointer hover:bg-primary/20 transition-colors"
-                  onClick={() => setIsPlaying(!isPlaying)}
-                >
-                  {isPlaying ? (
-                    <Pause className="w-8 h-8 text-primary" />
-                  ) : (
-                    <Play className="w-8 h-8 text-primary ml-1" />
-                  )}
+                <div className="w-16 h-16 rounded-sm border border-primary/50 bg-primary/10 flex items-center justify-center mb-4">
+                  <Play className="w-8 h-8 text-primary ml-1" />
                 </div>
-                <p className="text-sm font-medium orbitron uppercase tracking-wider">Clip Preview</p>
+                <p className="text-sm font-medium orbitron uppercase tracking-wider">No Preview Source</p>
                 <p className="text-xs text-center max-w-xs mt-2 text-muted-foreground">
-                  Simulated playback • Click play to preview timing
+                  The backend did not return a playable video source for this clip.
                 </p>
-                {videoUrl && (
+                {sourceUrl && (
                   <a
-                    href={videoUrl}
+                    href={sourceUrl}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="mt-4 text-primary hover:underline flex items-center gap-1 text-xs uppercase tracking-wider"
@@ -171,32 +237,26 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
               </div>
             )}
 
-            {/* Caption Overlay */}
             {currentCaption && (
               <div className="absolute bottom-16 left-0 right-0 flex justify-center px-4">
-                <div className={`px-4 py-2 rounded-sm ${
-                  currentCaption.emphasis
-                    ? "bg-primary text-primary-foreground font-bold"
-                    : "bg-background/80 text-foreground border border-border"
-                }`}>
+                <div
+                  className={`px-4 py-2 rounded-sm ${
+                    currentCaption.emphasis
+                      ? "bg-primary text-primary-foreground font-bold"
+                      : "bg-background/80 text-foreground border border-border"
+                  }`}
+                >
                   <p className="text-center text-sm uppercase tracking-wide">{currentCaption.text}</p>
                 </div>
               </div>
             )}
 
-            {/* Overlay Controls (non-embed) */}
             {!embedUrl && (
               <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-background/90 to-transparent p-4">
-                <Slider
-                  value={[currentTime]}
-                  max={duration}
-                  step={0.1}
-                  className="mb-3"
-                  onValueChange={([value]) => setCurrentTime(value)}
-                />
+                <Slider value={[currentTime]} max={duration} step={0.1} className="mb-3" onValueChange={([value]) => seekTo(value)} />
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <Button variant="ghost" size="icon" onClick={() => setIsPlaying(!isPlaying)}>
+                    <Button variant="ghost" size="icon" onClick={togglePlay}>
                       {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
                     </Button>
                     <Button variant="ghost" size="icon" onClick={() => setIsMuted(!isMuted)}>
@@ -211,7 +271,6 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
             )}
           </div>
 
-          {/* Clip Info */}
           <div className="p-4 bg-muted/30 rounded-sm mb-4 border border-border/50">
             <h4 className="text-xs font-bold uppercase tracking-wider mb-2 orbitron">Why This Clip?</h4>
             <p className="text-xs text-muted-foreground">{clipData.reason}</p>
@@ -223,7 +282,6 @@ export function VideoPreview({ isOpen, onClose, videoUrl, clipData, onEdit, onDo
             )}
           </div>
 
-          {/* Action Buttons */}
           <div className="flex gap-3">
             <Button variant="outline" className="flex-1" onClick={onEdit}>
               <Edit3 className="w-4 h-4 mr-2" />

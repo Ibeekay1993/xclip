@@ -4,6 +4,7 @@ export const API_URL =
   (import.meta.env.VITE_API_URL as string | undefined)?.trim() || DEFAULT_API_URL;
 
 export type ExportClipRequest = {
+  videoId?: string;
   videoUrl: string;
   start: number;
   end: number;
@@ -12,6 +13,72 @@ export type ExportClipRequest = {
   clipNumber?: number;
   title?: string;
 };
+
+export type ProcessVideoRequest = {
+  url: string;
+};
+
+export type UploadVideoResponse = {
+  success: boolean;
+  video_id: string;
+  duration?: number;
+  error?: string;
+};
+
+export type ProcessVideoResponse = {
+  success: boolean;
+  video_id: string;
+  duration?: number;
+  clips?: Array<Record<string, unknown>>;
+  transcription?: Array<Record<string, unknown>>;
+  source_url?: string;
+  error?: string;
+};
+
+export async function processVideoFromBackend(request: ProcessVideoRequest): Promise<ProcessVideoResponse> {
+  const response = await fetch(`${API_URL}/process-url`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url: request.url }),
+  });
+
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(data?.error || `Process failed with status ${response.status}`);
+  }
+  return data as ProcessVideoResponse;
+}
+
+export async function uploadVideoToBackend(file: File): Promise<UploadVideoResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(`${API_URL}/upload`, {
+    method: "POST",
+    body: formData,
+  });
+
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(data?.detail || data?.error || `Upload failed with status ${response.status}`);
+  }
+  return data as UploadVideoResponse;
+}
+
+export async function analyzeVideoFromBackend(videoId: string): Promise<ProcessVideoResponse> {
+  const response = await fetch(`${API_URL}/analyze/${videoId}`);
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(data?.detail || data?.error || `Analyze failed with status ${response.status}`);
+  }
+  return data as ProcessVideoResponse;
+}
+
+export function getBackendVideoUrl(videoId: string): string {
+  return `${API_URL}/video/${encodeURIComponent(videoId)}`;
+}
 
 export async function exportClipFromBackend(request: ExportClipRequest): Promise<Blob> {
   const controller = new AbortController();
@@ -29,6 +96,8 @@ export async function exportClipFromBackend(request: ExportClipRequest): Promise
         video_url: request.videoUrl,
         url: request.videoUrl,
         source_url: request.videoUrl,
+        video_id: request.videoId,
+        videoId: request.videoId,
         start: request.start,
         start_time: request.start,
         end: request.end,

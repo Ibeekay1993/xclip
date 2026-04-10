@@ -7,7 +7,13 @@ import { WorkflowStep } from "./WorkflowStep";
 import { ClipCard } from "./ClipCard";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
-import { exportClipFromBackend } from "@/lib/backend";
+import {
+  analyzeVideoFromBackend,
+  exportClipFromBackend,
+  getBackendVideoUrl,
+  processVideoFromBackend,
+  uploadVideoToBackend,
+} from "@/lib/backend";
 
 type Status = "idle" | "processing" | "complete" | "error";
 
@@ -20,6 +26,7 @@ interface TranscriptSegment {
 interface Clip {
   id: string;
   jobId?: string;
+  sourceVideoId?: string;
   clipNumber: number;
   start: number;
   end: number;
@@ -83,6 +90,31 @@ const normalizeClipWindow = (startRaw: number, endRaw: number, maxDuration = 900
   return { start: safeStart, end: boundedEnd, duration };
 };
 
+const inferPlatformFromUrl = (sourceUrl: string): string => {
+  try {
+    const host = new URL(sourceUrl).hostname.toLowerCase();
+    if (host.includes("youtube") || host.includes("youtu.be")) return "youtube";
+    if (host.includes("kick")) return "kick";
+    if (host.includes("twitch")) return "twitch";
+    if (host.includes("tiktok")) return "tiktok";
+  } catch {
+    // fall through
+  }
+  return "youtube";
+};
+
+const buildTranscriptText = (segments: TranscriptSegment[]): string =>
+  segments.map((segment) => `${formatTime(segment.start)} - ${segment.text}`).join("\n");
+
+const buildClipTranscript = (segments: TranscriptSegment[], start: number, end: number): string => {
+  const words = segments
+    .filter((segment) => segment.start >= start && segment.start <= end)
+    .map((segment) => segment.text)
+    .filter(Boolean);
+
+  return words.join(" ").trim();
+};
+
 export function ClipGenerator() {
   const [url, setUrl] = useState("");
   const [clipCount, setClipCount] = useState(5);
@@ -105,12 +137,26 @@ export function ClipGenerator() {
   const [previewClip, setPreviewClip] = useState<Clip | null>(null);
   const [editingClip, setEditingClip] = useState<Clip | null>(null);
   const [sourceUrl, setSourceUrl] = useState("");
+  const [sourcePlaybackUrl, setSourcePlaybackUrl] = useState("");
+  const [sourceVideoId, setSourceVideoId] = useState("");
   const [sourceType, setSourceType] = useState<"url" | "upload">("url");
   const [sourcePlatform, setSourcePlatform] = useState("youtube");
   const [transcriptData, setTranscriptData] = useState<{ transcript: string; segments: TranscriptSegment[] } | null>(null);
   const [recentJobs, setRecentJobs] = useState<RecentJob[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+
+  const loadRecentJobs = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("clip_jobs")
+      .select("id, video_url, video_title, status, error_message, created_at")
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    if (!error && data) {
+      setRecentJobs(data as RecentJob[]);
+    }
+  }, []);
 
   useEffect(() => {
     void loadRecentJobs();
@@ -127,10 +173,136 @@ export function ClipGenerator() {
     return () => window.clearInterval(interval);
   }, [isProcessing, recentJobs, loadRecentJobs]);
 
-  const processVideo = async (videoUrl?: string, inputType: "url" | "upload" = "url") => {
+  const processVideo = async (videoUrl?: string, inputType: "url" | "upload" = "url", file?: File) => {
     const targetUrl = (videoUrl || url).trim();
     if (!targetUrl) {
       toast({ title: "URL Required", description: "Please enter a valid video URL", variant: "destructive" });
+      return;
+    }
+
+    if (inputType === "url" || inputType === "upload") {
+      setIsProcessing(true);
+      setClips([]);
+      setTranscriptData(null);
+      setSourceUrl(targetUrl);
+      setSourcePlaybackUrl("");
+      setSourceVideoId("");
+      setSourceType(inputType);
+
+      let jobId: string | null = null;
+      try {
+        jobId = await createClipJob(targetUrl, undefined, inputType === "upload" ? "uploaded-file" : undefined);
+        setStatus((s) => ({ ...s, download: "processing" }));
+        if (jobId) await updateClipJobStatus(jobId, "downloading");
+
+        let backendVideoId = "";
+        let processResult: Awaited<ReturnType<typeof processVideoFromBackend>> | Awaited<ReturnType<typeof analyzeVideoFromBackend>>;
+
+        if (inputType === "upload") {
+          if (!file) throw new Error("Please select a video file to upload.");
+          const uploadResult = await uploadVideoToBackend(file);
+          backendVideoId = uploadResult.video_id;
+          const playbackUrl = getBackendVideoUrl(backendVideoId);
+          setSourceVideoId(backendVideoId);
+          setSourcePlaybackUrl(playbackUrl);
+          setSourcePlatform("upload");
+          setStatus((s) => ({ ...s, download: "complete", transcribe: "processing" }));
+          if (jobId) await updateClipJobStatus(jobId, "transcribing");
+          processResult = await analyzeVideoFromBackend(backendVideoId);
+        } else {
+          processResult = await processVideoFromBackend({ url: targetUrl });
+          backendVideoId = processResult.video_id;
+          const playbackUrl = getBackendVideoUrl(backendVideoId);
+          setSourceVideoId(backendVideoId);
+          setSourcePlaybackUrl(playbackUrl);
+          setSourcePlatform(inferPlatformFromUrl(targetUrl));
+          setStatus((s) => ({ ...s, download: "complete", transcribe: "processing" }));
+          if (jobId) await updateClipJobStatus(jobId, "transcribing");
+        }
+
+        const transcriptionSegments = Array.isArray(processResult.transcription)
+          ? processResult.transcription
+              .map((segment) => ({
+                start: Number((segment as any).start ?? 0),
+                end: Number((segment as any).end ?? 0),
+                text: String((segment as any).text ?? ""),
+              }))
+              .filter((segment) => segment.text.length > 0)
+          : [];
+
+        const transcriptText = buildTranscriptText(transcriptionSegments);
+        setTranscriptData({ transcript: transcriptText, segments: transcriptionSegments });
+
+        setStatus((s) => ({ ...s, transcribe: "complete", analyze: "processing" }));
+        if (jobId) await updateClipJobStatus(jobId, "analyzing");
+
+        const backendClips = Array.isArray(processResult.clips) ? processResult.clips : [];
+        const detectedDuration = Number(processResult.duration || transcriptionSegments[transcriptionSegments.length - 1]?.end || 900);
+        const platform = inputType === "upload" ? "youtube" : inferPlatformFromUrl(targetUrl);
+        const defaultPreset = getPlatformDefaultPreset(platform);
+
+        setStatus((s) => ({ ...s, analyze: "complete", generate: "processing" }));
+        if (jobId) await updateClipJobStatus(jobId, "generating");
+
+        const generatedClips: Clip[] = backendClips.map((clip: any, index: number) => {
+          const startValue = Number(clip.start ?? clip.start_time ?? 0);
+          const endValue = Number(clip.end ?? clip.end_time ?? 0);
+          const normalized = normalizeClipWindow(startValue, endValue, detectedDuration);
+          const clipTranscript = clip.transcript || buildClipTranscript(transcriptionSegments, normalized.start, normalized.end);
+
+          return {
+            id: `clip-${Date.now()}-${index}`,
+            jobId: jobId || undefined,
+            sourceVideoId: backendVideoId || undefined,
+            clipNumber: Number(clip.clip_number || index + 1),
+            start: normalized.start,
+            end: normalized.end,
+            reason: String(clip.reason || "Strong self-contained highlight"),
+            hookScore: Number(clip.hook_score || 70),
+            transcript: clipTranscript,
+            thumbnailUrl: "/placeholder.svg",
+            exportPreset: defaultPreset,
+            platform,
+          };
+        });
+
+        if (jobId) {
+          await saveGeneratedClips(jobId, generatedClips, inputType, getBackendVideoUrl(backendVideoId) || targetUrl);
+          await updateClipJobStatus(jobId, "complete");
+        }
+
+        setClips(generatedClips);
+        setStatus((s) => ({ ...s, generate: "complete" }));
+        void loadRecentJobs();
+
+        toast({
+          title: "Analysis Complete",
+          description: `${generatedClips.length} viral clips detected from ${platform}${targetUrl ? ` • ${targetUrl}` : ""}`,
+        });
+      } catch (error) {
+        console.error("Processing error:", error);
+        if (jobId) {
+          try {
+            await updateClipJobStatus(jobId, "error", error instanceof Error ? error.message : "An error occurred");
+          } catch {
+            // Best effort only.
+          }
+        }
+        setStatus((s) => ({
+          ...s,
+          download: s.download === "processing" ? "error" : s.download,
+          transcribe: s.transcribe === "processing" ? "error" : s.transcribe,
+          analyze: s.analyze === "processing" ? "error" : s.analyze,
+          generate: s.generate === "processing" ? "error" : s.generate,
+        }));
+        toast({
+          title: "Processing Failed",
+          description: error instanceof Error ? error.message : "An error occurred",
+          variant: "destructive",
+        });
+      } finally {
+        setIsProcessing(false);
+      }
       return;
     }
 
@@ -270,13 +442,8 @@ export function ClipGenerator() {
     toast({ title: "Uploading Video", description: "Please wait while we upload your video..." });
 
     try {
-      const fileName = `${Date.now()}-${file.name}`;
-      const { error: uploadError } = await supabase.storage.from("videos").upload(fileName, file);
-      if (uploadError) throw uploadError;
-
-      const { data: urlData } = supabase.storage.from("videos").getPublicUrl(fileName);
       toast({ title: "Upload Complete", description: "Processing your video..." });
-      await processVideo(urlData.publicUrl, "upload");
+      await processVideo(file.name, "upload", file);
     } catch (error) {
       console.error("Upload error:", error);
       toast({ title: "Upload Failed", description: error instanceof Error ? error.message : "Failed to upload video", variant: "destructive" });
@@ -289,6 +456,8 @@ export function ClipGenerator() {
     setClips([]);
     setIsProcessing(false);
     setSourceUrl("");
+    setSourcePlaybackUrl("");
+    setSourceVideoId("");
     setSourceType("url");
     setSourcePlatform("youtube");
     setTranscriptData(null);
@@ -302,18 +471,6 @@ export function ClipGenerator() {
     a.click();
     URL.revokeObjectURL(blobUrl);
   };
-
-  const loadRecentJobs = useCallback(async () => {
-    const { data, error } = await supabase
-      .from("clip_jobs")
-      .select("id, video_url, video_title, status, error_message, created_at")
-      .order("created_at", { ascending: false })
-      .limit(5);
-
-    if (!error && data) {
-      setRecentJobs(data as RecentJob[]);
-    }
-  }, []);
 
   const createClipJob = async (videoUrl: string, videoTitle?: string, uploadedFileUrl?: string) => {
     const { data, error } = await supabase
@@ -362,7 +519,7 @@ export function ClipGenerator() {
   const handleDownload = async (clip: Clip, format?: string) => {
     const preset = format || clip.exportPreset || "9:16";
     try {
-      const source = sourceUrl || url;
+      const source = sourcePlaybackUrl || sourceUrl || url;
       if (!source) {
         toast({ title: "Source missing", description: "Please process a video first.", variant: "destructive" });
         return;
@@ -375,6 +532,7 @@ export function ClipGenerator() {
           : `Server-side FFmpeg is creating clip #${clip.clipNumber}...`,
       });
       const blob = await exportClipFromBackend({
+        videoId: clip.sourceVideoId || sourceVideoId || undefined,
         videoUrl: source,
         start: clip.start,
         end: clip.end,
@@ -630,7 +788,8 @@ export function ClipGenerator() {
         <VideoPreview
           isOpen={!!previewClip}
           onClose={() => setPreviewClip(null)}
-          videoUrl={sourceUrl || url}
+          videoUrl={sourcePlaybackUrl || sourceUrl || url}
+          sourceUrl={sourceUrl || url}
           clipData={previewClip ? {
             id: previewClip.id,
             clipNumber: previewClip.clipNumber,
